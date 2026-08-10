@@ -27,13 +27,29 @@ except ImportError as e:
     sys.exit(1)
 
 # 로깅 설정 - MCP는 stdout을 JSON-RPC로 사용하므로 stderr로만 출력
+# 로그 파일은 반드시 절대 경로로 — 상대 경로로 두면 서버가 기동된 CWD(= 그때그때의
+# 프로젝트 폴더)마다 hwp_mcp.log가 생성되어 사용자 작업 폴더를 오염시킨다.
+_LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA")
+                        or os.path.expanduser("~"), "hwp-mcp")
+try:
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    _LOG_PATH = os.path.join(_LOG_DIR, "hwp_mcp.log")
+except Exception:
+    _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "hwp_mcp.log")
+
+_handlers = [logging.StreamHandler(sys.stderr)]
+try:
+    from logging.handlers import RotatingFileHandler
+    _handlers.insert(0, RotatingFileHandler(_LOG_PATH, maxBytes=2_000_000,
+                                            backupCount=2, encoding="utf-8"))
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('hwp_mcp.log'),
-        logging.StreamHandler(sys.stderr)
-    ]
+    handlers=_handlers
 )
 logger = logging.getLogger(__name__)
 
