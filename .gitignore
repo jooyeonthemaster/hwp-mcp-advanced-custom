@@ -55,3 +55,7 @@ test_document.hwp
 *.md
 !README.md
 !INSTALLATION_GUIDE.md
+!THIRD_PARTY_NOTICES.md
+
+# 개인 로컬 설정 (공개 불필요)
+.claude/
