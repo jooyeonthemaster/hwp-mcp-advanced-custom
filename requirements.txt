@@ -1,4 +1,6 @@
 mcp>=1.0.0
 fastmcp>=0.1.0
 pywin32>=306
-pythoncom
+# 선택: 페이지 실측(measure_layout)·이미지 비율 계산에 사용
+pymupdf>=1.24
+Pillow>=10.0

@@ -2,6 +2,33 @@
 
 고도화된 한글(HWP) MCP 서버 - 한글의 모든 기능을 제어할 수 있는 MCP 서버입니다.
 
+## 🔥 v2 (robust) — 실전 검증 기반 대규모 개선
+
+실제 정부지원 사업계획서 자동화 프로젝트에서 발견된 결함들을 전면 수정하고, 검증된 노하우를 도구로 승격했습니다.
+
+**핵심 버그 수정**
+- 한글 텍스트 모지바케(CP949↔Latin-1) 자동 복구 — `get_text_all`/`find_text` 등 전 추출 경로
+- `get_text_by_page`/`move_to_page`의 `HGotoE.PageNumber` AttributeError → `DialogResult`+`SetSelectionIndex` 방식으로 수정
+- 찾기/바꾸기 `SeveralWords` 단어 단위 오동작 → 정확 문자열 매칭 + 실행 후 잔존 검증 + 부재 시 거짓 성공 방지
+- 글자색 RGB→COLORREF(BGR) 변환 (기존: red가 파란색으로 표시)
+- mm→HWPUNIT 변환 오류(×100 → ×283.465): 여백·용지·이미지 크기 전부
+- `PageSetup` 항목 위치 오류(silent no-op) → `HSecDef.PageDef` 경유로 수정
+- 표 생성: `WidthType=0`+`WidthValue` 필수 조합 + **표 밖 커서 탈출** (기존: 이후 내용이 표 안에 중첩)
+- 이미지 삽입: mm 크기 강제 적용 (기존: 원본 픽셀 크기로 삽입됨)
+- **보안 대화상자 제거**: `security_module/FilePathCheckerModule.dll` 자동 레지스트리 등록 — 파일 접근 시마다 뜨던 "접근 허용" 창이 사라짐
+
+**신규 도구 (v2)**
+- `find_text_and_move` — 커서를 실제로 이동시키는 찾기 (occurrence 지정)
+- `fill_cell_after_label` / `clear_cell_after_label` — 양식 표의 라벨 옆 셀 기입/완전 비우기(자동번호 해제 포함, 표-밖 가드)
+- `delete_paragraph_containing` — 특수문자 차이에 안전한 문단 삭제
+- `format_text_occurrence` — 특정 텍스트만 서식 변경(RGB 색상)
+- `list_document_images` / `resize_document_image` — 그림 개체 나열·비율 유지 리사이즈
+- `measure_layout` — PDF 실측 기반 페이지·마커 위치·이미지 배치 측정 (PyMuPDF)
+- `render_content_blocks` — 구조화 JSON 블록(제목/불릿/표/이미지/주석)을 조판 규칙대로 렌더링
+- `kill_hwp_processes` — 파일 잠금 해제용 프로세스 정리
+
+전체 76개 도구. 실기기 COM 테스트 36항목 통과.
+
 ## 🚀 주요 기능
 
 ### 기본 문서 제어

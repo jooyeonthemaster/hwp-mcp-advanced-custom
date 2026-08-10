@@ -49,10 +49,36 @@ class AdvancedHwpController:
         self.is_initialized = False
         self.current_document = None
         
+    @staticmethod
+    def ensure_security_module_registry():
+        """보안모듈(FilePathCheckerModule) 레지스트리 자가 복구.
+        값이 실제 DLL 경로가 아니면 저장소 동봉 DLL로 재등록한다.
+        이 등록이 없으면 파일 접근 시마다 '접근 허용' 대화상자가 떠서 자동화가 멈춘다."""
+        try:
+            import winreg
+            bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "security_module", "FilePathCheckerModule.dll")
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                                   r"Software\HNC\HwpAutomation\Modules")
+            try:
+                cur, _ = winreg.QueryValueEx(key, "FilePathCheckerModule")
+            except OSError:
+                cur = None
+            if (not cur or not os.path.exists(str(cur))) and os.path.exists(bundled):
+                winreg.SetValueEx(key, "FilePathCheckerModule", 0,
+                                  winreg.REG_SZ, bundled)
+                logger.info(f"보안모듈 레지스트리 자동 등록: {bundled}")
+            winreg.CloseKey(key)
+        except Exception as e:
+            logger.warning(f"보안모듈 레지스트리 확인 실패(무시): {e}")
+
     def initialize(self):
         """한글 COM 객체 초기화"""
         try:
             pythoncom.CoInitialize()
+
+            # 보안모듈 레지스트리 선확인 (파일 접근 대화상자 방지)
+            self.ensure_security_module_registry()
 
             # 한글 프로그램이 설치되어 있는지 확인
             try:
@@ -129,6 +155,245 @@ class AdvancedHwpController:
 
 # 전역 컨트롤러 인스턴스
 hwp_controller = AdvancedHwpController()
+
+
+# ============================================================
+# 핵심 인프라 헬퍼 (v2)
+#  - 실전 검증에서 발견된 HWP COM 함정들을 한 곳에서 처리한다
+# ============================================================
+
+MM_TO_HWPUNIT = 283.465          # 1mm = 283.465 HWPUNIT (7200unit/inch)
+
+
+def _mm(hwp, mm: float) -> int:
+    """mm -> HWPUNIT. MiliToHwpUnit이 있으면 사용, 없으면 상수 변환."""
+    try:
+        return hwp.MiliToHwpUnit(mm)
+    except Exception:
+        return int(mm * MM_TO_HWPUNIT)
+
+
+def _rgb_to_colorref(color) -> int:
+    """RGB(사람이 아는 순서) -> HWP COLORREF(0x00BBGGRR).
+    'red'/'#FF3B30'/'FF3B30'/0xFF3B30 모두 허용."""
+    named = {
+        "black": 0x000000, "white": 0xFFFFFF, "red": 0xFF0000,
+        "blue": 0x0000FF, "green": 0x008000, "yellow": 0xFFD400,
+        "orange": 0xFF7A00, "purple": 0x800080, "cyan": 0x00B7C3,
+        "gray": 0x777777, "grey": 0x777777, "navy": 0x1A2B4A,
+        "brown": 0x8B2B00,
+    }
+    try:
+        if isinstance(color, str):
+            key = color.strip().lower()
+            if key in named:
+                rgb = named[key]
+            else:
+                rgb = int(key.lstrip("#"), 16)
+        else:
+            rgb = int(color)
+    except (ValueError, TypeError):
+        logger.warning(f"알 수 없는 색상 '{color}' — 검정으로 대체")
+        rgb = 0x000000
+    r = (rgb >> 16) & 0xFF
+    g = (rgb >> 8) & 0xFF
+    b = rgb & 0xFF
+    return (b << 16) | (g << 8) | r          # COLORREF = BGR
+
+
+def _fix_mojibake(text: str) -> str:
+    """GetTextFile 등이 CP949 바이트를 Latin-1로 잘못 해석해 반환하는 경우 복구.
+    (실증: 한글이 '¡à ¿¹¼úºÐ¾ß'처럼 보이는 증상)"""
+    if not text:
+        return text
+    sample = text[:4000]
+    hangul = sum(1 for ch in sample if '가' <= ch <= '힣')
+    high_latin = sum(1 for ch in sample if 0x80 <= ord(ch) <= 0xFF)
+    if high_latin > 20 and high_latin > hangul * 3:
+        try:
+            repaired = text.encode("latin-1", "replace").decode("cp949", "replace")
+            rep_hangul = sum(1 for ch in repaired[:4000] if '가' <= ch <= '힣')
+            # 오탐 방지: 복구본에 '충분한' 한글이 나와야 진짜 모지바케로 판정
+            # (정상 유럽어 문서를 우연히 한글 몇 자로 재해석하는 경우 배제)
+            if rep_hangul >= 10 and rep_hangul > hangul * 2 and rep_hangul > high_latin * 0.3:
+                return repaired
+        except Exception:
+            pass
+    return text
+
+
+def _extract_text(hwp, scope: str = "document") -> str:
+    """유니코드 안전 텍스트 추출.
+    scope='document' 전체 / 'selection' 현재 선택.
+    1순위 InitScan/GetText(문서 전체, 커서 불변), 2순위 GetTextFile+모지바케 복구."""
+    if scope == "document":
+        # 1순위: SelectAll + GetTextFile — 표 안 텍스트까지 포함됨(검증됨).
+        #        InitScan 방식은 표 셀을 건너뛰어 일부만 반환하는 문제가 있어 폴백으로만 사용.
+        pos = None
+        try:
+            pos = hwp.GetPos()
+        except Exception:
+            pass
+        hwp.HAction.Run("SelectAll")
+        raw = hwp.GetTextFile("TEXT", "")
+        hwp.HAction.Run("Cancel")
+        if pos:
+            try:
+                hwp.SetPos(*pos)
+            except Exception:
+                pass
+        text = _fix_mojibake(raw or "")
+        if text:
+            return text
+        # 폴백: InitScan/GetText (본문 문단 위주)
+        try:
+            hwp.InitScan(0, 0x0077)
+            chunks = []
+            for _ in range(100000):
+                state, txt = hwp.GetText()
+                if state in (0, 1):          # 0=완료, 1=오류
+                    break
+                if txt:
+                    chunks.append(txt)
+            hwp.ReleaseScan()
+            return "\r\n".join(chunks)      # 문단 경계 유지
+        except Exception:
+            try:
+                hwp.ReleaseScan()
+            except Exception:
+                pass
+            return ""
+    else:
+        # 선택 영역 전용 — 폴백으로 GetTextFile("TEXT","")를 쓰면 문서 '전체'가
+        # 반환되어 호출자가 선택 내용으로 오인하므로 절대 금지 (빈 선택 = 빈 문자열이 정답)
+        raw = hwp.GetTextFile("TEXT", "saveblock:true")
+        return _fix_mojibake(raw or "")
+
+
+def _find_once(hwp, text: str, from_start: bool = True) -> bool:
+    """RepeatFind로 커서를 실제 이동시키는 찾기. 찾으면 해당 텍스트가 선택된 상태."""
+    if from_start:
+        hwp.HAction.Run("MoveDocBegin")
+    ps = hwp.HParameterSet.HFindReplace
+    hwp.HAction.GetDefault("RepeatFind", ps.HSet)
+    ps.FindString = text
+    ps.IgnoreMessage = 1
+    ps.Direction = 0
+    ps.SeveralWords = 0              # 정확 문자열 매칭 (1이면 단어 단위 오동작)
+    return bool(hwp.HAction.Execute("RepeatFind", ps.HSet))
+
+
+def _replace_all(hwp, find_str: str, replace_str: str) -> bool:
+    """AllReplace 안전판: IgnoreMessage/정확매칭/문서 처음부터. 반환값: 실행 후 잔존 여부 검사."""
+    hwp.HAction.Run("MoveDocBegin")
+    ps = hwp.HParameterSet.HFindReplace
+    hwp.HAction.GetDefault("AllReplace", ps.HSet)
+    ps.FindString = find_str
+    ps.ReplaceString = replace_str
+    ps.IgnoreMessage = 1
+    ps.Direction = 0
+    ps.SeveralWords = 0
+    ps.ReplaceMode = 1
+    hwp.HAction.Execute("AllReplace", ps.HSet)
+    # 검증: 아직 남아 있으면 실패로 간주.
+    # 단, 치환 결과가 검색어를 (대소문자 무시로) 포함하면 재발견되므로 검증 생략
+    # (HWP 기본 찾기는 대소문자를 무시함 — 'ai'→'AI' 치환의 오판 방지)
+    if replace_str and find_str.lower() in replace_str.lower():
+        return True
+    remained = _find_once(hwp, find_str)
+    hwp.HAction.Run("Cancel")
+    return not remained
+
+
+def _charshape_selection(hwp, size_pt=None, bold=None, italic=None,
+                         underline=None, color=None, face=None):
+    """현재 선택 영역에 글자 서식 적용. color는 RGB 입력."""
+    ps = hwp.HParameterSet.HCharShape
+    hwp.HAction.GetDefault("CharShape", ps.HSet)
+    if face:
+        for attr in ("FaceNameHangul", "FaceNameLatin", "FaceNameHanja",
+                     "FaceNameJapanese", "FaceNameOther", "FaceNameSymbol",
+                     "FaceNameUser"):
+            try:
+                setattr(ps, attr, face)
+            except Exception:
+                pass
+    if size_pt is not None:
+        ps.Height = int(size_pt * 100)
+    if bold is not None:
+        ps.Bold = 1 if bold else 0
+    if italic is not None:
+        ps.Italic = 1 if italic else 0
+    if underline is not None:
+        # HCharShape에는 'Underline' 속성이 없음(UnderlineType이 실명) — 실기기 typelib 확인
+        try:
+            ps.UnderlineType = 1 if underline else 0
+        except Exception:
+            try:
+                ps.HSet.SetItem("UnderlineType", 1 if underline else 0)
+            except Exception:
+                pass
+    if color is not None:
+        ps.TextColor = _rgb_to_colorref(color)
+    hwp.HAction.Execute("CharShape", ps.HSet)
+
+
+def _clear_list_content(hwp, lst: int, max_paras: int = 800) -> int:
+    """지정 리스트(셀) 내부를 완전히 비운다. 마지막 문단 끝까지 선택해야 잔재가 안 남고,
+    자동번호(HeadingType)는 텍스트 삭제로 안 지워지므로 함께 해제한다. 반환: 지운 문단 수."""
+    cleared = 0
+    for _ in range(6):
+        last = 0
+        for i in range(0, max_paras):
+            hwp.SetPos(lst, i, 0)
+            cur = hwp.GetPos()
+            if cur[0] == lst and cur[1] == i:
+                last = i
+            else:
+                break
+        hwp.SetPos(lst, last, 0)
+        hwp.HAction.Run("MoveParaEnd")
+        endc = hwp.GetPos()[2]
+        if last == 0 and endc == 0:
+            break
+        hwp.SetPos(lst, 0, 0)
+        hwp.SelectText(0, 0, last, endc)
+        hwp.HAction.Run("Delete")
+        cleared = max(cleared, last + 1)
+        hwp.SetPos(lst, 0, 0)
+    # 남은 문단들의 자동번호 제거
+    for i in range(0, 30):
+        hwp.SetPos(lst, i, 0)
+        cur = hwp.GetPos()
+        if cur[0] != lst or cur[1] != i:
+            break
+        try:
+            ps = hwp.HParameterSet.HParaShape
+            hwp.HAction.GetDefault("ParagraphShape", ps.HSet)
+            if getattr(ps, "HeadingType", 0) != 0:
+                ps.HeadingType = 0
+                hwp.HAction.Execute("ParagraphShape", ps.HSet)
+        except Exception:
+            pass
+    hwp.SetPos(lst, 0, 0)
+    return cleared
+
+
+def _iter_pictures(hwp):
+    """문서 내 그림(gso) 컨트롤 목록."""
+    pics = []
+    ctrl = hwp.HeadCtrl
+    while ctrl:
+        try:
+            if ctrl.CtrlID == "gso":
+                pics.append(ctrl)
+        except Exception:
+            pass
+        try:
+            ctrl = ctrl.Next
+        except Exception:
+            break
+    return pics
 
 @mcp.tool()
 def initialize_hwp() -> str:
@@ -610,7 +875,11 @@ def quit_hwp() -> str:
     """한글 프로그램을 종료합니다."""
     try:
         hwp_controller.check_initialization()
-        
+
+        try:
+            hwp_controller.hwp.Clear(1)      # 저장 안 함 모드로 정리 (COM 예외 무시)
+        except Exception:
+            pass
         hwp_controller.hwp.Quit()
         hwp_controller.hwp = None
         hwp_controller.is_initialized = False
@@ -673,33 +942,11 @@ def apply_font_format(font_name: str = "맑은 고딕",
     try:
         hwp_controller.check_initialization()
         
-        color_map = {
-            "black": 0x000000,
-            "red": 0xFF0000,
-            "blue": 0x0000FF,
-            "green": 0x00FF00,
-            "yellow": 0xFFFF00,
-            "purple": 0xFF00FF,
-            "cyan": 0x00FFFF
-        }
-        
-        color_value = color_map.get(color.lower(), 0x000000)
-        
-        act = hwp_controller.hwp.CreateAction("CharShape")
-        pset = act.CreateSet()
-        pset.SetItem("FaceNameHangul", font_name)
-        pset.SetItem("FaceNameLatin", font_name)
-        pset.SetItem("FaceNameHanja", font_name)
-        pset.SetItem("FaceNameJapanese", font_name)
-        pset.SetItem("FaceNameOther", font_name)
-        pset.SetItem("FaceNameSymbol", font_name)
-        pset.SetItem("FaceNameUser", font_name)
-        pset.SetItem("Height", font_size * 100)
-        pset.SetItem("Bold", bold)
-        pset.SetItem("Italic", italic)
-        pset.SetItem("Underline", underline)
-        pset.SetItem("TextColor", color_value)
-        act.Execute(pset)
+        # 색상은 RGB로 받아 내부에서 COLORREF(BGR)로 변환한다.
+        # (기존 버전은 RGB 값을 그대로 넣어 red가 파란색으로 나오는 버그가 있었음)
+        _charshape_selection(hwp_controller.hwp, size_pt=font_size, bold=bold,
+                             italic=italic, underline=underline,
+                             color=color, face=font_name)
         
         logger.info(f"글꼴 서식 적용 완료: {font_name}, {font_size}pt")
         return f"글꼴 서식을 적용했습니다: {font_name}, {font_size}pt"
@@ -731,50 +978,135 @@ def find_and_replace(find_text: str, replace_text: str, replace_all: bool = Fals
         hwp_controller.check_initialization()
         hwp = hwp_controller.hwp
 
-        # 문서 시작으로 이동
-        hwp.HAction.Run("MoveDocBegin")
-
-        # HParameterSet 방식 사용
         if replace_all:
-            hwp.HAction.GetDefault("AllReplace", hwp.HParameterSet.HFindReplace.HSet)
-            hwp.HParameterSet.HFindReplace.FindString = find_text
-            hwp.HParameterSet.HFindReplace.ReplaceString = replace_text
-            hwp.HParameterSet.HFindReplace.ReplaceMode = 1  # 모두 바꾸기
-            result = hwp.HAction.Execute("AllReplace", hwp.HParameterSet.HFindReplace.HSet)
-        else:
-            hwp.HAction.GetDefault("Replace", hwp.HParameterSet.HFindReplace.HSet)
-            hwp.HParameterSet.HFindReplace.FindString = find_text
-            hwp.HParameterSet.HFindReplace.ReplaceString = replace_text
-            result = hwp.HAction.Execute("Replace", hwp.HParameterSet.HFindReplace.HSet)
-
-        if result:
-            logger.info(f"찾기/바꾸기 완료: '{find_text}' -> '{replace_text}'")
-            return f"'{find_text}'를 '{replace_text}'로 {'모두 ' if replace_all else ''}바꾸었습니다."
-        else:
+            # 사전 존재 확인 — 없으면 '0건 치환'을 성공으로 오보하는 것을 방지
+            existed = _find_once(hwp, find_text)
+            hwp.HAction.Run("Cancel")
+            if not existed:
+                return f"'{find_text}'를 찾을 수 없습니다."
+            ok = _replace_all(hwp, find_text, replace_text)
+            if ok:
+                logger.info(f"찾기/바꾸기 완료: '{find_text}' -> '{replace_text}'")
+                return f"'{find_text}'를 '{replace_text}'로 모두 바꾸었습니다. (잔존 없음 확인)"
+            # 정확 매칭 실패 시 원인 안내 (특수문자·따옴표 차이 가능성)
+            if _find_once(hwp, find_text):
+                hwp.HAction.Run("Cancel")
+                return (f"일부 치환에 실패했습니다: '{find_text}'가 아직 남아 있습니다. "
+                        f"곡선따옴표(’ ‘) 등 특수문자 차이를 확인하거나 "
+                        f"delete_paragraph_containing 도구를 사용하세요.")
             return f"'{find_text}'를 찾을 수 없습니다."
+        else:
+            # 단건 치환: 액션 ID('Replace'/'ExecReplace')는 버전별로 불확실 —
+            # 찾기(선택 상태) + Delete + InsertText 조합이 결정적이고 안전하다
+            if not _find_once(hwp, find_text):
+                hwp.HAction.Run("Cancel")
+                return f"'{find_text}'를 찾을 수 없습니다."
+            hwp.HAction.Run("Delete")           # 선택된 찾은 텍스트 삭제
+            ps = hwp.HParameterSet.HInsertText
+            hwp.HAction.GetDefault("InsertText", ps.HSet)
+            ps.Text = replace_text
+            hwp.HAction.Execute("InsertText", ps.HSet)
+            logger.info(f"찾기/바꾸기 완료: '{find_text}' -> '{replace_text}'")
+            return f"첫 번째 '{find_text}'를 '{replace_text}'로 바꾸었습니다."
 
     except Exception as e:
         logger.error(f"찾기/바꾸기 실패: {e}")
         return f"찾기/바꾸기 실패: {e}"
 
 @mcp.tool()
-def create_table(rows: int, cols: int, border: bool = True) -> str:
-    """표를 생성합니다."""
+def create_table(rows: int, cols: int, border: bool = True,
+                 width_mm: float = 150.0, row_height_mm: float = 5.2,
+                 col_widths: Optional[str] = None,
+                 data_json: Optional[str] = None,
+                 header_bold: bool = True, font_size: float = 10.0) -> str:
+    """커서 위치에 표를 생성합니다. (선택) 데이터까지 채우고 표 밖으로 안전하게 탈출합니다.
+
+    - width_mm: 표 전체 폭(mm). 단 폭에 맞추되 이 값 기준으로 열 폭을 배분
+    - col_widths: 열 폭 비율 JSON 배열 예: "[2,1,1]" (생략 시 균등)
+    - data_json: 셀 내용 JSON 2차원 배열 예: '[["구분","값"],["A","1"]]'
+      첫 행은 header_bold=True면 굵게·가운데 정렬
+    주의: HWP 특성상 WidthType=0이어도 WidthValue를 반드시 지정해야 열 폭이 유지되며,
+    표 입력 후 커서를 명시적으로 표 밖으로 빼지 않으면 이후 내용이 표 안에 중첩됩니다.
+    이 도구는 두 문제를 모두 처리합니다."""
     try:
         hwp_controller.check_initialization()
-        
-        act = hwp_controller.hwp.CreateAction("TableCreate")
+        hwp = hwp_controller.hwp
+
+        widths = None
+        if col_widths:
+            try:
+                widths = json.loads(col_widths)
+            except Exception:
+                return f"col_widths JSON 파싱 실패: {col_widths}"
+        data = None
+        if data_json:
+            try:
+                data = json.loads(data_json)
+            except Exception:
+                return f"data_json JSON 파싱 실패: {data_json[:80]}"
+            if len(data) > rows or any(len(r) > cols for r in data):
+                return "data_json 크기가 rows/cols보다 큽니다."
+
+        # 표 생성 전 위치 기록 (탈출용)
+        L0, P0, _ = hwp.GetPos()
+
+        act = hwp.CreateAction("TableCreate")
         pset = act.CreateSet()
+        act.GetDefault(pset)
         pset.SetItem("Rows", rows)
         pset.SetItem("Cols", cols)
-        pset.SetItem("WidthType", 2)
-        pset.SetItem("HeightType", 0)
-        pset.SetItem("CreateItemArray", [0, 1, 0])
+        pset.SetItem("WidthType", 0)                     # 단에 맞춤
+        pset.SetItem("HeightType", 1)
+        pset.SetItem("WidthValue", _mm(hwp, width_mm))   # WidthType=0이어도 필수!
+        pset.SetItem("HeightValue", _mm(hwp, row_height_mm * rows))
+        try:
+            arr = pset.CreateItemArray("ColWidth", cols)
+            ws = widths if widths and len(widths) == cols else [1.0] * cols
+            tot = float(sum(ws))
+            for i, v in enumerate(ws):
+                arr.SetItem(i, _mm(hwp, width_mm * v / tot))
+        except Exception:
+            pass
         act.Execute(pset)
-        
-        logger.info(f"표 생성 완료: {rows}행 {cols}열")
-        return f"{rows}행 {cols}열 표를 생성했습니다."
-        
+
+        # (선택) 데이터 채우기 — 생성 직후 커서는 첫 셀
+        if data:
+            for r in range(rows):
+                for c in range(cols):
+                    val = ""
+                    if r < len(data) and c < len(data[r]):
+                        val = str(data[r][c])
+                    is_head = header_bold and r == 0
+                    _charshape_selection(hwp, size_pt=font_size, bold=is_head)
+                    try:
+                        pp = hwp.HParameterSet.HParaShape
+                        hwp.HAction.GetDefault("ParagraphShape", pp.HSet)
+                        pp.AlignType = 3 if is_head else 1   # 헤더 가운데/본문 왼쪽
+                        hwp.HAction.Execute("ParagraphShape", pp.HSet)
+                    except Exception:
+                        pass
+                    if val:
+                        tp = hwp.HParameterSet.HInsertText
+                        hwp.HAction.GetDefault("InsertText", tp.HSet)
+                        tp.Text = val
+                        hwp.HAction.Execute("InsertText", tp.HSet)
+                    if not (r == rows - 1 and c == cols - 1):
+                        hwp.HAction.Run("TableRightCell")
+
+        # 표 밖으로 확실히 탈출 (MoveDown은 커서가 표 안으로 되돌아가므로 금지)
+        hwp.HAction.Run("Cancel")
+        hwp.HAction.Run("CloseEx")
+        cur = hwp.GetPos()
+        if cur[0] != L0:
+            hwp.SetPos(L0, P0 + 1, 0)
+        else:
+            hwp.SetPos(L0, cur[1], 0)
+        hwp.HAction.Run("MoveLineEnd")
+
+        filled = f", 데이터 {sum(len(r) for r in data)}셀 입력" if data else ""
+        logger.info(f"표 생성 완료: {rows}x{cols}{filled}")
+        return f"{rows}행 {cols}열 표를 생성했습니다 (폭 {width_mm}mm{filled}). 커서는 표 다음 문단에 있습니다."
+
     except Exception as e:
         logger.error(f"표 생성 실패: {e}")
         return f"표 생성 실패: {e}"
@@ -785,13 +1117,18 @@ def set_page_margins(top: int = 20, bottom: int = 20, left: int = 20, right: int
     try:
         hwp_controller.check_initialization()
         
-        act = hwp_controller.hwp.CreateAction("PageSetup")
-        pset = act.CreateSet()
-        pset.SetItem("TopMargin", top * 100)
-        pset.SetItem("BottomMargin", bottom * 100)
-        pset.SetItem("LeftMargin", left * 100)
-        pset.SetItem("RightMargin", right * 100)
-        act.Execute(pset)
+        hwp = hwp_controller.hwp
+        # 여백 항목은 파라미터셋 루트가 아니라 HSecDef.PageDef 하위에 있음
+        # (루트 SetItem은 예외 없이 무시되는 silent no-op — 실기기 확인)
+        sd = hwp.HParameterSet.HSecDef
+        hwp.HAction.GetDefault("PageSetup", sd.HSet)
+        sd.PageDef.TopMargin = _mm(hwp, top)
+        sd.PageDef.BottomMargin = _mm(hwp, bottom)
+        sd.PageDef.LeftMargin = _mm(hwp, left)
+        sd.PageDef.RightMargin = _mm(hwp, right)
+        sd.HSet.SetItem("ApplyClass", 24)
+        sd.HSet.SetItem("ApplyTo", 3)
+        hwp.HAction.Execute("PageSetup", sd.HSet)
         
         logger.info(f"페이지 여백 설정 완료: 상{top} 하{bottom} 좌{left} 우{right}mm")
         return f"페이지 여백을 설정했습니다: 상{top} 하{bottom} 좌{left} 우{right}mm"
@@ -884,12 +1221,16 @@ def set_page_size(width: int = 210, height: int = 297, orientation: str = "portr
         if orientation.lower() == "landscape":
             width, height = height, width
         
-        act = hwp_controller.hwp.CreateAction("PageSetup")
-        pset = act.CreateSet()
-        pset.SetItem("Width", width * 100)
-        pset.SetItem("Height", height * 100)
-        pset.SetItem("Orientation", 1 if orientation.lower() == "landscape" else 0)
-        act.Execute(pset)
+        hwp = hwp_controller.hwp
+        # 용지 항목의 실명은 PageDef.PaperWidth/PaperHeight/Landscape (루트 Width/Height는 없음)
+        sd = hwp.HParameterSet.HSecDef
+        hwp.HAction.GetDefault("PageSetup", sd.HSet)
+        sd.PageDef.PaperWidth = _mm(hwp, width)
+        sd.PageDef.PaperHeight = _mm(hwp, height)
+        sd.PageDef.Landscape = 1 if orientation.lower() == "landscape" else 0
+        sd.HSet.SetItem("ApplyClass", 24)
+        sd.HSet.SetItem("ApplyTo", 3)
+        hwp.HAction.Execute("PageSetup", sd.HSet)
         
         logger.info(f"용지 설정 완료: {width}x{height}mm, {orientation}")
         return f"용지를 설정했습니다: {width}x{height}mm, {orientation}"
@@ -899,26 +1240,43 @@ def set_page_size(width: int = 210, height: int = 297, orientation: str = "portr
         return f"용지 설정 실패: {e}"
 
 @mcp.tool()
-def insert_image(image_path: str, x: int = 0, y: int = 0, width: int = 100, height: int = 100) -> str:
-    """이미지를 삽입합니다."""
+def insert_image(image_path: str, x: int = 0, y: int = 0,
+                 width: float = 100, height: float = 0) -> str:
+    """커서 위치에 이미지를 삽입합니다. width/height는 mm 단위.
+    height=0이면 이미지 원본 비율로 자동 계산. 삽입 후 커서는 이미지 뒤로 이동합니다."""
     try:
         hwp_controller.check_initialization()
-        
+        hwp = hwp_controller.hwp
+
+        image_path = os.path.abspath(image_path)
         if not os.path.exists(image_path):
             return f"이미지 파일을 찾을 수 없습니다: {image_path}"
-        
-        act = hwp_controller.hwp.CreateAction("InsertPicture")
-        pset = act.CreateSet()
-        pset.SetItem("Path", image_path)
-        pset.SetItem("Embedded", True)
-        pset.SetItem("sizeoption", 3)
-        pset.SetItem("Width", width * 100)
-        pset.SetItem("Height", height * 100)
-        act.Execute(pset)
-        
-        logger.info(f"이미지 삽입 완료: {image_path}")
-        return f"이미지를 삽입했습니다: {image_path}"
-        
+
+        if not height:
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(image_path) as im:
+                    height = round(width * im.height / im.width, 1)
+            except Exception:
+                height = width * 0.6      # PIL 없으면 3:5 근사
+
+        # InsertPicture의 sizeoption은 버전별 해석이 달라 신뢰할 수 없음 —
+        # 삽입 후 반환된 컨트롤의 Properties로 크기를 강제 지정한다(검증된 경로).
+        ctrl = hwp.InsertPicture(image_path, True, 2, False, False, 0,
+                                 _mm(hwp, width), _mm(hwp, height))
+        try:
+            p = ctrl.Properties
+            p.SetItem("Width", _mm(hwp, width))
+            p.SetItem("Height", _mm(hwp, height))
+            ctrl.Properties = p
+        except Exception:
+            pass
+        hwp.HAction.Run("Cancel")        # 개체 선택 해제
+        hwp.HAction.Run("MoveRight")     # 이미지 뒤로
+
+        logger.info(f"이미지 삽입 완료: {image_path} ({width}x{height}mm)")
+        return f"이미지를 삽입했습니다: {os.path.basename(image_path)} ({width}x{height}mm)"
+
     except Exception as e:
         logger.error(f"이미지 삽입 실패: {e}")
         return f"이미지 삽입 실패: {e}"
@@ -1079,14 +1437,29 @@ def export_to_pdf(output_path: str) -> str:
     try:
         hwp_controller.check_initialization()
         
-        act = hwp_controller.hwp.CreateAction("FileSaveAsPdf")
-        pset = act.CreateSet()
-        pset.SetItem("filename", output_path)
-        pset.SetItem("Format", "PDF")
-        act.Execute(pset)
-        
-        logger.info(f"PDF 내보내기 완료: {output_path}")
-        return f"PDF로 내보냈습니다: {output_path}"
+        hwp = hwp_controller.hwp
+        output_path = os.path.abspath(output_path)
+
+        ok = False
+        try:
+            ok = bool(hwp.SaveAs(output_path, "PDF", ""))
+        except Exception as e1:
+            logger.warning(f"SaveAs PDF 실패, 액션 방식 재시도: {e1}")
+            try:
+                act = hwp.CreateAction("FileSaveAsPdf")
+                pset = act.CreateSet()
+                act.GetDefault(pset)
+                pset.SetItem("filename", output_path)
+                pset.SetItem("Format", "PDF")
+                act.Execute(pset)
+                ok = True
+            except Exception as e2:
+                return f"PDF 내보내기 실패: {e2}"
+
+        if os.path.exists(output_path):
+            logger.info(f"PDF 내보내기 완료: {output_path}")
+            return f"PDF로 내보냈습니다: {output_path}"
+        return f"PDF 내보내기가 실행됐지만 파일이 확인되지 않습니다: {output_path}"
         
     except Exception as e:
         logger.error(f"PDF 내보내기 실패: {e}")
@@ -1098,15 +1471,10 @@ def get_text_all() -> str:
     try:
         hwp_controller.check_initialization()
 
-        hwp_controller.hwp.HAction.Run("SelectAll")
-        text = hwp_controller.hwp.GetTextFile("TEXT", "")
-        hwp_controller.hwp.HAction.Run("MoveDocBegin")
-
-        if text is None:
-            text = ""
+        text = _extract_text(hwp_controller.hwp, "document")
 
         logger.info(f"전체 텍스트 읽기 완료: {len(text)} 글자")
-        return text
+        return text if text else "(문서가 비어 있습니다)"
         
     except Exception as e:
         logger.error(f"텍스트 읽기 실패: {e}")
@@ -1118,18 +1486,22 @@ def get_text_by_page(page_number: int) -> str:
     try:
         hwp_controller.check_initialization()
 
-        hwp_controller.hwp.HAction.GetDefault("Goto", hwp_controller.hwp.HParameterSet.HGotoE.HSet)
-        hwp_controller.hwp.HParameterSet.HGotoE.PageNumber = page_number
-        hwp_controller.hwp.HAction.Execute("Goto", hwp_controller.hwp.HParameterSet.HGotoE.HSet)
+        hwp = hwp_controller.hwp
+        total_pages = hwp.PageCount
+        if page_number < 1 or page_number > total_pages:
+            return f"페이지 번호가 범위를 벗어났습니다. (1~{total_pages})"
+        # HGotoE에는 PageNumber 속성이 없음(기존 버그) — DialogResult+SetSelectionIndex 사용
+        ps = hwp.HParameterSet.HGotoE
+        hwp.HAction.GetDefault("Goto", ps.HSet)
+        ps.HSet.SetItem("DialogResult", page_number)
+        ps.SetSelectionIndex = 1          # 1 = 페이지 기준 이동
+        hwp.HAction.Execute("Goto", ps.HSet)
 
-        hwp_controller.hwp.HAction.Run("MovePageBegin")
-        hwp_controller.hwp.HAction.Run("MoveSelPageDown")
+        hwp.HAction.Run("MovePageBegin")
+        hwp.HAction.Run("MoveSelPageDown")
 
-        text = hwp_controller.hwp.GetTextFile("TEXT", "")
-        hwp_controller.hwp.HAction.Run("Cancel")
-
-        if text is None:
-            text = ""
+        text = _extract_text(hwp, "selection")
+        hwp.HAction.Run("Cancel")
 
         logger.info(f"{page_number}페이지 텍스트 읽기 완료")
         return text
@@ -1144,7 +1516,7 @@ def get_selected_text() -> str:
     try:
         hwp_controller.check_initialization()
 
-        text = hwp_controller.hwp.GetTextFile("TEXT", "")
+        text = _fix_mojibake(hwp_controller.hwp.GetTextFile("TEXT", "") or "")
 
         if text is None:
             text = ""
@@ -1168,7 +1540,7 @@ def get_paragraph_text(paragraph_index: int = 0) -> str:
             hwp_controller.hwp.HAction.Run("MoveParaDown")
 
         hwp_controller.hwp.HAction.Run("MoveSelParaDown")
-        text = hwp_controller.hwp.GetTextFile("TEXT", "")
+        text = _fix_mojibake(hwp_controller.hwp.GetTextFile("TEXT", "") or "")
         hwp_controller.hwp.HAction.Run("Cancel")
 
         if text is None:
@@ -1249,7 +1621,7 @@ def get_table_as_csv(table_index: int = 1, output_path: Optional[str] = None) ->
             hwp.HAction.Run("TableRowBegin")
             hwp.HAction.Run("TableCellBlockExtendAll")
             
-            table_text = hwp.GetTextFile("TEXT", "")
+            table_text = _fix_mojibake(hwp.GetTextFile("TEXT", "") or "")
 
             if table_text is None:
                 table_text = ""
@@ -1369,12 +1741,7 @@ def find_text(search_text: str, show_context: bool = True) -> str:
         
         hwp = hwp_controller.hwp
         
-        hwp.HAction.Run("SelectAll")
-        full_text = hwp.GetTextFile("TEXT", "")
-        hwp.HAction.Run("MoveDocBegin")
-
-        if full_text is None:
-            full_text = ""
+        full_text = _extract_text(hwp, "document")
 
         if not full_text:
             return "문서에 내용이 없습니다."
@@ -1483,16 +1850,11 @@ def fill_template(field_values: str) -> str:
             
             replaced = False
             for placeholder in placeholders:
-                hwp.HAction.Run("MoveDocBegin")
-                
-                hwp.HAction.GetDefault("AllReplace", hwp.HParameterSet.HFindReplace.HSet)
-                hwp.HParameterSet.HFindReplace.FindString = placeholder
-                hwp.HParameterSet.HFindReplace.ReplaceString = field_value
-                hwp.HParameterSet.HFindReplace.ReplaceMode = 1
-                
-                execute_result = hwp.HAction.Execute("AllReplace", hwp.HParameterSet.HFindReplace.HSet)
-                
-                if execute_result:
+                if not _find_once(hwp, placeholder):
+                    hwp.HAction.Run("Cancel")
+                    continue
+                hwp.HAction.Run("Cancel")
+                if _replace_all(hwp, placeholder, field_value):
                     results.append(f"O {placeholder} -> '{field_value}': 완료")
                     total_filled += 1
                     replaced = True
@@ -1542,12 +1904,7 @@ def get_document_structure() -> str:
         
         doc_name = doc_path.split("\\")[-1] if doc_path != "(새 문서)" else "새 문서"
         
-        hwp.HAction.Run("SelectAll")
-        full_text = hwp.GetTextFile("TEXT", "")
-        hwp.HAction.Run("MoveDocBegin")
-
-        if full_text is None:
-            full_text = ""
+        full_text = _extract_text(hwp, "document")
 
         char_count = len(full_text.replace('\r\n', '').replace(' ', '')) if full_text else 0
         paragraph_count = full_text.count('\r\n') + 1 if full_text else 0
@@ -1650,9 +2007,11 @@ def move_to_page(page_number: int) -> str:
         if page_number < 1 or page_number > total_pages:
             return f"페이지 번호가 범위를 벗어났습니다. (1~{total_pages})"
 
-        hwp.HAction.GetDefault("Goto", hwp.HParameterSet.HGotoE.HSet)
-        hwp.HParameterSet.HGotoE.PageNumber = page_number
-        hwp.HAction.Execute("Goto", hwp.HParameterSet.HGotoE.HSet)
+        ps = hwp.HParameterSet.HGotoE
+        hwp.HAction.GetDefault("Goto", ps.HSet)
+        ps.HSet.SetItem("DialogResult", page_number)
+        ps.SetSelectionIndex = 1          # 1 = 페이지 기준 이동
+        hwp.HAction.Execute("Goto", ps.HSet)
 
         logger.info(f"{page_number}페이지로 이동 완료")
         return f"{page_number}페이지로 이동했습니다."
@@ -1731,7 +2090,7 @@ def delete_selected_text() -> str:
         hwp = hwp_controller.hwp
 
         # 선택된 텍스트 확인
-        selected_text = hwp.GetTextFile("TEXT", "")
+        selected_text = _fix_mojibake(hwp.GetTextFile("TEXT", "") or "")
         if selected_text is None:
             selected_text = ""
 
@@ -1762,21 +2121,16 @@ def delete_all_occurrences(text: str) -> str:
         if not text:
             return "삭제할 텍스트를 지정해주세요."
 
-        # find_and_replace의 로직을 사용하여 모두 삭제
-        hwp.HAction.Run("MoveDocBegin")
-
-        hwp.HAction.GetDefault("AllReplace", hwp.HParameterSet.HFindReplace.HSet)
-        hwp.HParameterSet.HFindReplace.FindString = text
-        hwp.HParameterSet.HFindReplace.ReplaceString = ""
-        hwp.HParameterSet.HFindReplace.ReplaceMode = 1  # 모두 바꾸기
-
-        result = hwp.HAction.Execute("AllReplace", hwp.HParameterSet.HFindReplace.HSet)
-
-        if result:
-            logger.info(f"'{text}' 모두 삭제 완료")
-            return f"'{text}'를 모두 삭제했습니다."
-        else:
+        existed = _find_once(hwp, text)
+        hwp.HAction.Run("Cancel")
+        if not existed:
             return f"'{text}'를 찾을 수 없습니다."
+
+        if _replace_all(hwp, text, ""):
+            logger.info(f"'{text}' 모두 삭제 완료")
+            return f"'{text}'를 모두 삭제했습니다. (잔존 없음 확인)"
+        return (f"일부 삭제에 실패했습니다: '{text}'가 아직 남아 있습니다. "
+                f"특수문자 차이가 있으면 delete_paragraph_containing을 사용하세요.")
 
     except Exception as e:
         logger.error(f"텍스트 삭제 실패: {e}")
@@ -2222,7 +2576,7 @@ def select_paragraph_by_number(paragraph_number: int) -> str:
         hwp.HAction.Run("MoveSelParaDown")
 
         # 선택된 내용 확인
-        selected_text = hwp.GetTextFile("TEXT", "")
+        selected_text = _fix_mojibake(hwp.GetTextFile("TEXT", "") or "")
         if selected_text is None:
             selected_text = ""
 
@@ -2259,7 +2613,7 @@ def select_page_content(page_number: int) -> str:
         hwp.HAction.Run("MoveSelPageDown")
 
         # 선택된 내용 확인
-        selected_text = hwp.GetTextFile("TEXT", "")
+        selected_text = _fix_mojibake(hwp.GetTextFile("TEXT", "") or "")
         if selected_text is None:
             selected_text = ""
 
@@ -2441,7 +2795,7 @@ def replace_paragraph(paragraph_number: int, new_text: str) -> str:
         hwp.HAction.Run("MoveSelParaDown")
 
         # 기존 내용 확인
-        old_text = hwp.GetTextFile("TEXT", "")
+        old_text = _fix_mojibake(hwp.GetTextFile("TEXT", "") or "")
         if old_text is None:
             old_text = ""
 
@@ -2460,6 +2814,423 @@ def replace_paragraph(paragraph_number: int, new_text: str) -> str:
     except Exception as e:
         logger.error(f"문단 교체 실패: {e}")
         return f"문단 교체 실패: {e}"
+
+
+# ============================================================
+# v2 신규 도구 — 실전 문서 자동화에서 검증된 패턴들
+# ============================================================
+
+@mcp.tool()
+def find_text_and_move(search_text: str, occurrence: int = 1,
+                       select: bool = False) -> str:
+    """텍스트를 찾아 커서를 실제로 그 위치로 이동합니다. (기존 find_text는 위치 보고만 함)
+    occurrence: 몇 번째 일치로 이동할지 (1부터). select=True면 찾은 텍스트를 선택 상태로 둠."""
+    try:
+        hwp_controller.check_initialization()
+        hwp = hwp_controller.hwp
+
+        found = _find_once(hwp, search_text, from_start=True)
+        n = 1
+        while found and n < occurrence:
+            found = _find_once(hwp, search_text, from_start=False)
+            n += 1
+        if not found:
+            hwp.HAction.Run("Cancel")
+            return f"'{search_text}' {occurrence}번째 일치를 찾을 수 없습니다. ({n-1}개까지 확인)"
+        if not select:
+            hwp.HAction.Run("Cancel")
+        pos = hwp.GetPos()
+        logger.info(f"찾기 이동: '{search_text}' #{occurrence} -> {pos}")
+        return (f"'{search_text}' {occurrence}번째 위치로 이동했습니다. "
+                f"(list={pos[0]}, para={pos[1]}, pos={pos[2]}"
+                f"{', 선택됨' if select else ''})")
+    except Exception as e:
+        logger.error(f"찾기 이동 실패: {e}")
+        return f"찾기 이동 실패: {e}"
+
+
+@mcp.tool()
+def fill_cell_after_label(label: str, value: str, hops: int = 1,
+                          clear_existing: bool = True) -> str:
+    """표에서 라벨 셀을 찾아 오른쪽 셀에 값을 기입합니다. 신청서·양식 빈칸 채우기의 표준 방법.
+    hops: 라벨에서 오른쪽으로 이동할 셀 수."""
+    try:
+        hwp_controller.check_initialization()
+        hwp = hwp_controller.hwp
+
+        if not _find_once(hwp, label):
+            hwp.HAction.Run("Cancel")
+            return f"라벨을 찾을 수 없습니다: {label}"
+        hwp.HAction.Run("Cancel")
+        for _ in range(hops):
+            hwp.HAction.Run("TableRightCell")
+        # 표 밖이면 TableRightCell이 no-op → 본문을 훼손하기 전에 중단 (필수 가드)
+        if hwp.GetPos()[0] == 0:
+            return (f"'{label}'이(가) 표 안에 없습니다 (첫 일치가 본문 텍스트). "
+                    f"문서를 변경하지 않았습니다. 라벨을 더 구체적으로 지정하세요.")
+        if clear_existing:
+            hwp.HAction.Run("MoveParaBegin")
+            hwp.HAction.Run("MoveSelParaEnd")
+            hwp.HAction.Run("Delete")
+        ps = hwp.HParameterSet.HInsertText
+        hwp.HAction.GetDefault("InsertText", ps.HSet)
+        ps.Text = value
+        hwp.HAction.Execute("InsertText", ps.HSet)
+        logger.info(f"셀 기입: {label} -> {value}")
+        return f"'{label}' 오른쪽 {hops}번째 셀에 기입했습니다: {value}"
+    except Exception as e:
+        logger.error(f"셀 기입 실패: {e}")
+        return f"셀 기입 실패: {e}"
+
+
+@mcp.tool()
+def clear_cell_after_label(label: str, hops: int = 1) -> str:
+    """라벨 셀 기준 오른쪽 셀의 내용을 완전히 비웁니다 (여러 문단·자동번호 포함).
+    안내문 삭제('※ 삭제 후 제출' 지시 이행) 등에 사용."""
+    try:
+        hwp_controller.check_initialization()
+        hwp = hwp_controller.hwp
+
+        if not _find_once(hwp, label):
+            hwp.HAction.Run("Cancel")
+            return f"라벨을 찾을 수 없습니다: {label}"
+        hwp.HAction.Run("Cancel")
+        for _ in range(hops):
+            hwp.HAction.Run("TableRightCell")
+        lst = hwp.GetPos()[0]
+        if lst == 0:
+            return "커서가 표 안이 아닙니다. 라벨이 표 밖에 있는 것 같습니다."
+        cleared = _clear_list_content(hwp, lst)
+        logger.info(f"셀 비움: {label} (list={lst}, 문단 {cleared}개)")
+        return f"'{label}' 오른쪽 셀을 비웠습니다. (문단 {cleared}개, 자동번호 해제 포함)"
+    except Exception as e:
+        logger.error(f"셀 비움 실패: {e}")
+        return f"셀 비움 실패: {e}"
+
+
+@mcp.tool()
+def delete_paragraph_containing(search_text: str) -> str:
+    """지정 텍스트를 '포함한' 문단의 텍스트 전체를 삭제합니다.
+    곡선따옴표 등 특수문자 때문에 정확 매칭 치환이 실패할 때의 확실한 대안.
+    주의: 빈 문단 자체는 남습니다(문단 병합은 커서 상태를 꼬이게 할 수 있어 하지 않음)."""
+    try:
+        hwp_controller.check_initialization()
+        hwp = hwp_controller.hwp
+
+        if not _find_once(hwp, search_text):
+            hwp.HAction.Run("Cancel")
+            return f"'{search_text}'를 찾을 수 없습니다."
+        hwp.HAction.Run("Cancel")
+        hwp.HAction.Run("MoveParaBegin")
+        hwp.HAction.Run("MoveSelParaEnd")
+        hwp.HAction.Run("Delete")
+        logger.info(f"문단 삭제: '{search_text}' 포함 문단")
+        return f"'{search_text}'를 포함한 문단의 텍스트를 삭제했습니다."
+    except Exception as e:
+        logger.error(f"문단 삭제 실패: {e}")
+        return f"문단 삭제 실패: {e}"
+
+
+@mcp.tool()
+def format_text_occurrence(search_text: str, color: Optional[str] = None,
+                           bold: Optional[bool] = None,
+                           italic: Optional[bool] = None,
+                           font_size: Optional[float] = None,
+                           occurrence: int = 1) -> str:
+    """특정 텍스트를 찾아 그 부분만 서식을 바꿉니다. color는 RGB(예: '#000000', 'red').
+    양식의 파란 이탤릭 안내 서식을 검정 정자체로 바꾸는 등에 사용."""
+    try:
+        hwp_controller.check_initialization()
+        hwp = hwp_controller.hwp
+
+        found = _find_once(hwp, search_text, from_start=True)
+        n = 1
+        while found and n < occurrence:
+            found = _find_once(hwp, search_text, from_start=False)
+            n += 1
+        if not found:
+            hwp.HAction.Run("Cancel")
+            return f"'{search_text}'를 찾을 수 없습니다."
+        # 찾은 텍스트가 선택된 상태 — 그대로 서식 적용
+        _charshape_selection(hwp, size_pt=font_size, bold=bold,
+                             italic=italic, color=color)
+        hwp.HAction.Run("Cancel")
+        changes = []
+        if color is not None:
+            changes.append(f"색={color}")
+        if bold is not None:
+            changes.append(f"굵게={bold}")
+        if italic is not None:
+            changes.append(f"기울임={italic}")
+        if font_size is not None:
+            changes.append(f"{font_size}pt")
+        logger.info(f"서식 변경: '{search_text}' ({', '.join(changes)})")
+        return f"'{search_text}'의 서식을 변경했습니다: {', '.join(changes) or '(변경 없음)'}"
+    except Exception as e:
+        logger.error(f"서식 변경 실패: {e}")
+        return f"서식 변경 실패: {e}"
+
+
+@mcp.tool()
+def list_document_images() -> str:
+    """문서 내 모든 그림 개체의 번호와 크기(mm)를 나열합니다. resize_document_image와 함께 사용."""
+    try:
+        hwp_controller.check_initialization()
+        hwp = hwp_controller.hwp
+
+        pics = _iter_pictures(hwp)
+        if not pics:
+            return "문서에 그림·도형 개체가 없습니다."
+        lines = [f"그림·도형 개체 {len(pics)}개 (gso — 그림 외 글상자·도형 포함 가능):"]
+        for i, c in enumerate(pics):
+            try:
+                p = c.Properties
+                wmm = p.Item("Width") / MM_TO_HWPUNIT
+                hmm = p.Item("Height") / MM_TO_HWPUNIT
+                lines.append(f"  #{i}: {wmm:.1f} x {hmm:.1f} mm")
+            except Exception:
+                lines.append(f"  #{i}: (크기 조회 실패)")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"그림 나열 실패: {e}")
+        return f"그림 나열 실패: {e}"
+
+
+@mcp.tool()
+def resize_document_image(index: int, width_mm: float,
+                          height_mm: float = 0) -> str:
+    """문서 내 index번째 그림(list_document_images 기준)의 크기를 조정합니다.
+    height_mm=0이면 원본 비율 유지. 분량 조절 시 텍스트를 지우는 대신 이미지를 줄일 때 사용."""
+    try:
+        hwp_controller.check_initialization()
+        hwp = hwp_controller.hwp
+
+        pics = _iter_pictures(hwp)
+        if not (0 <= index < len(pics)):
+            return f"그림 번호 범위 초과: {index} (0~{len(pics)-1})"
+        c = pics[index]
+        p = c.Properties
+        wm = p.Item("Width") / MM_TO_HWPUNIT
+        hm = p.Item("Height") / MM_TO_HWPUNIT
+        th = height_mm if height_mm else round(hm * width_mm / wm, 1)
+        p.SetItem("Width", int(width_mm * MM_TO_HWPUNIT))
+        p.SetItem("Height", int(th * MM_TO_HWPUNIT))
+        c.Properties = p
+        logger.info(f"그림 리사이즈 #{index}: {wm:.1f}x{hm:.1f} -> {width_mm}x{th}")
+        return f"그림 #{index}: {wm:.1f}x{hm:.1f}mm -> {width_mm}x{th}mm"
+    except Exception as e:
+        logger.error(f"그림 리사이즈 실패: {e}")
+        return f"그림 리사이즈 실패: {e}"
+
+
+@mcp.tool()
+def measure_layout(marker_texts: Optional[str] = None) -> str:
+    """문서를 임시 PDF로 내보내 실제 레이아웃을 실측합니다. (PageCount보다 정확)
+    - 총 페이지 수
+    - marker_texts(JSON 배열, 예: '["1-1. 창업 동기","서식 1"]')가 처음 나타나는 페이지
+    - 각 마커 페이지의 이미지 개수 (텍스트만 보면 이미지 넘침을 놓치므로)
+    PyMuPDF(fitz)가 필요합니다: pip install pymupdf"""
+    try:
+        hwp_controller.check_initialization()
+        hwp = hwp_controller.hwp
+
+        try:
+            import fitz
+        except ImportError:
+            return ("PyMuPDF가 설치되어 있지 않습니다: pip install pymupdf\n"
+                    f"(참고: 한글 PageCount = {hwp.PageCount})")
+
+        import tempfile
+        tmp_pdf = os.path.join(tempfile.gettempdir(),
+                               f"hwp_measure_{os.getpid()}.pdf")
+        try:
+            hwp.SaveAs(tmp_pdf, "PDF", "")
+        except Exception as e:
+            return f"실측용 PDF 내보내기 실패: {e}"
+        if not os.path.exists(tmp_pdf):
+            return "실측용 PDF가 생성되지 않았습니다."
+
+        markers = []
+        if marker_texts:
+            try:
+                parsed = json.loads(marker_texts)
+                if isinstance(parsed, list):
+                    markers = [str(m) for m in parsed]
+                else:
+                    markers = [str(parsed)]     # 스칼라 JSON도 마커 1개로 취급
+            except Exception:
+                markers = [m.strip() for m in marker_texts.split(",") if m.strip()]
+
+        doc = fitz.open(tmp_pdf)
+        lines = [f"총 {len(doc)}페이지 (한글 PageCount={hwp.PageCount})"]
+        pos = {}
+        img_per_page = {}
+        for i, page in enumerate(doc):
+            img_per_page[i + 1] = len(page.get_images(full=True))
+            if markers:
+                t = page.get_text()
+                for m in markers:
+                    if m not in pos and m in t:
+                        pos[m] = i + 1
+        for m in markers:
+            pg = pos.get(m)
+            if pg:
+                lines.append(f"  '{m}': p{pg} (해당 페이지 이미지 {img_per_page.get(pg, 0)}개)")
+            else:
+                lines.append(f"  '{m}': 못 찾음")
+        if len(pos) >= 2:
+            vals = [pos[m] for m in markers if m in pos]
+            lines.append(f"  구간 길이(마지막-첫): {max(vals) - min(vals)}p")
+        doc.close()
+        try:
+            os.remove(tmp_pdf)
+        except Exception:
+            pass
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"레이아웃 실측 실패: {e}")
+        return f"레이아웃 실측 실패: {e}"
+
+
+@mcp.tool()
+def render_content_blocks(blocks_json: str, base_font_size: float = 10.5) -> str:
+    """구조화된 블록(JSON 배열)을 커서 위치에 조판 규칙대로 렌더링합니다.
+    저수준 커서 조작 없이 문서 본문을 만들 때 사용. 블록 타입:
+      {"type":"h","text":...}        제목 (ㅇ 접두, 굵게)
+      {"type":"b","text":...}        불릿 (- 접두)
+      {"type":"b2","text":...}       하위 불릿 (· 접두)
+      {"type":"p","text":...}        문단
+      {"type":"callout","text":...}  강조 (▶ 접두, 진갈색)
+      {"type":"note","text":...}     주석 (※ 접두, 회색)
+      {"type":"t","headers":[...],"rows":[[...]],"widths":[...],"title":...}  표
+      {"type":"img","path":...,"width_mm":...,"caption":...}  이미지
+    표는 폭 유지·탈출 처리가 내장되어 있습니다."""
+    try:
+        hwp_controller.check_initialization()
+        hwp = hwp_controller.hwp
+
+        try:
+            blocks = json.loads(blocks_json)
+        except Exception as e:
+            return f"blocks_json 파싱 실패: {e}"
+        if not isinstance(blocks, list):
+            return "blocks_json은 JSON 배열이어야 합니다."
+
+        def para_shape(align=0, left=0, indent=0, sb=0.0, sa=0.0, ls=150):
+            ps = hwp.HParameterSet.HParaShape
+            hwp.HAction.GetDefault("ParagraphShape", ps.HSet)
+            ps.AlignType = align
+            ps.LeftMargin = _mm(hwp, left)
+            ps.Indentation = _mm(hwp, indent)
+            ps.PrevSpacing = int(sb * 100)
+            ps.NextSpacing = int(sa * 100)
+            ps.LineSpacing = ls
+            hwp.HAction.Execute("ParagraphShape", ps.HSet)
+
+        def put(text):
+            ps = hwp.HParameterSet.HInsertText
+            hwp.HAction.GetDefault("InsertText", ps.HSet)
+            ps.Text = text
+            hwp.HAction.Execute("InsertText", ps.HSet)
+
+        def para(text="", size=None, bold=False, color=None, align=0,
+                 left=0, indent=0, sb=0.0, sa=0.0, ls=150):
+            para_shape(align, left, indent, sb, sa, ls)
+            _charshape_selection(hwp, size_pt=size or base_font_size,
+                                 bold=bold, color=color or 0x000000)
+            if text:
+                put(text)
+            hwp.HAction.Run("BreakPara")
+
+        bs = base_font_size
+        rendered = 0
+        skipped = 0
+        for b in blocks:
+            if not isinstance(b, dict):
+                skipped += 1
+                continue
+            t = b.get("type")
+            if t == "h":
+                para("ㅇ " + b.get("text", ""), size=bs + 0.5, bold=True,
+                     sb=5, sa=1.5, ls=160)
+            elif t == "b":
+                para("- " + b.get("text", ""), left=3.5, indent=-3.5,
+                     sa=0.5, ls=150)
+            elif t == "b2":
+                para("· " + b.get("text", ""), size=bs - 0.5, left=7.0,
+                     indent=-3.0, sa=0.4, ls=145, color=0x333333)
+            elif t == "p":
+                para(b.get("text", ""), left=3.5, sa=1.0, ls=155)
+            elif t == "callout":
+                para("▶ " + b.get("text", ""), bold=True, left=3.5,
+                     indent=-3.5, sb=2.0, sa=2.0, ls=150, color=0x8B2B00)
+            elif t == "note":
+                para("※ " + b.get("text", ""), size=bs - 0.5, left=3.5,
+                     sa=1.0, ls=140, color=0x666666)
+            elif t == "t":
+                if b.get("title"):
+                    para("· " + b["title"], size=bs - 0.5, bold=True,
+                         left=3.5, sb=2.0, sa=1.0, ls=145)
+                hd = b.get("headers") or []
+                rw = b.get("rows") or []
+                data = ([hd] + rw) if hd else rw
+                if data:
+                    nr, nc = len(data), max(len(r) for r in data)
+                    res = create_table(nr, nc, width_mm=b.get("width_mm", 150),
+                                       col_widths=json.dumps(b.get("widths"))
+                                       if b.get("widths") else None,
+                                       data_json=json.dumps(data, ensure_ascii=False),
+                                       header_bold=bool(hd),
+                                       font_size=bs - 0.5)
+                    if "실패" in res:
+                        return f"표 렌더 중단: {res}"
+                    para("", size=5, ls=100)
+            elif t == "img":
+                path = b.get("path", "")
+                if path and os.path.exists(path):
+                    res = insert_image(path, width=b.get("width_mm", 100),
+                                       height=b.get("height_mm", 0))
+                    hwp.HAction.Run("BreakPara")
+                    if b.get("caption"):
+                        para("※ " + b["caption"], size=bs - 0.5, align=3,
+                             color=0x888888, sa=1.5, ls=130)
+                else:
+                    para(f"[이미지 없음: {path}]", color="red")
+            rendered += 1
+
+        logger.info(f"블록 렌더 완료: {rendered}개 (건너뜀 {skipped}개)")
+        note = f" (dict가 아닌 항목 {skipped}개 건너뜀)" if skipped else ""
+        return f"{rendered}개 블록을 렌더링했습니다.{note}"
+    except Exception as e:
+        logger.error(f"블록 렌더 실패: {e}")
+        return f"블록 렌더 실패: {e}"
+
+
+@mcp.tool()
+def kill_hwp_processes() -> str:
+    """모든 한글(Hwp) 프로세스를 강제 종료합니다. 파일 잠금(PermissionError)으로
+    문서를 열 수 없을 때 사용하세요. 저장하지 않은 변경사항은 사라지니 주의."""
+    try:
+        import subprocess
+        killed = []
+        for name in ("Hwp.exe", "HwpApi.exe", "Hwp"):
+            try:
+                r = subprocess.run(["taskkill", "/F", "/IM",
+                                    name if name.endswith(".exe") else name + ".exe"],
+                                   capture_output=True, text=True, timeout=15)
+                if r.returncode == 0:
+                    killed.append(name)
+            except Exception:
+                pass
+        # 컨트롤러 상태 리셋
+        hwp_controller.hwp = None
+        hwp_controller.is_initialized = False
+        hwp_controller.current_document = None
+        if killed:
+            return f"한글 프로세스를 종료했습니다: {', '.join(killed)}. 다음 도구 호출 시 자동으로 재초기화됩니다."
+        return "종료할 한글 프로세스가 없습니다."
+    except Exception as e:
+        return f"프로세스 종료 실패: {e}"
 
 
 def main():
