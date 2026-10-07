@@ -1,0 +1,12 @@
+{
+  "name": "hwp-document",
+  "version": "1.0.0",
+  "description": "한컴 한글(HWP·HWPX) 문서 작업 스킬 — 한컴 MCP 안전 사용 순서, HWPX XML 수술로 양식 빈칸 채우기, im-not-ai(humanize-korean) 윤문 연동, 한글 재열기 검증.",
+  "author": {
+    "name": "jooyeonthemaster"
+  },
+  "homepage": "https://github.com/jooyeonthemaster/hwp-mcp-advanced-custom",
+  "repository": "https://github.com/jooyeonthemaster/hwp-mcp-advanced-custom",
+  "license": "MIT",
+  "keywords": ["hwp", "hwpx", "hancom", "한글", "한컴", "양식", "신청서"]
+}

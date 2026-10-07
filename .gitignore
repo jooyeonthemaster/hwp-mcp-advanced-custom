@@ -56,6 +56,11 @@ test_document.hwp
 !README.md
 !INSTALLATION_GUIDE.md
 !THIRD_PARTY_NOTICES.md
+!skills/*/SKILL.md
 
 # 개인 로컬 설정 (공개 불필요)
 .claude/
+
+# 실데이터 방지 — 채운 양식·윤문 작업 폴더는 공개 저장소에 올리지 않는다
+*.hwpx
+_workspace/
