@@ -1,0 +1,19 @@
+{
+  "name": "hwp-mcp-advanced-custom",
+  "owner": {
+    "name": "jooyeonthemaster"
+  },
+  "metadata": {
+    "description": "한컴 한글 문서 작업 스킬(hwp-document) 마켓플레이스",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "hwp-document",
+      "source": "./",
+      "description": "한컴 MCP 안전 사용 순서 + HWPX 양식 채우기 도구 + im-not-ai 윤문 연동",
+      "version": "1.0.0",
+      "keywords": ["hwp", "hwpx", "hancom", "한글"]
+    }
+  ]
+}

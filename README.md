@@ -29,6 +29,23 @@
 
 전체 76개 도구. 실기기 COM 테스트 36항목 통과.
 
+## 🧩 Claude 스킬: hwp-document
+
+MCP 서버와 함께 쓰는 **한컴 문서 작업 스킬**이 `skills/hwp-document/` 에 있습니다.
+
+- **양식 빈칸 채우기**: `scripts/hwpx_fill.py` — HWPX를 ZIP/XML 문자열 수술로 채웁니다. 병합 셀 표에서도 칸이 어긋나지 않고, 한글의 "변조 가능성" 경고를 피합니다(`inspect` → `fill --dry-run` → `fill`).
+- **MCP 안전 사용 순서와 함정 대응**: 경고창 블로킹, 침묵 저장 실패, 타임아웃 뒤 상태 확인.
+- **본문 윤문**: AI가 쓴 서술형 문단을 [im-not-ai](https://github.com/epoko77-ai/im-not-ai)(`humanize-korean`)로 다듬은 뒤 넣습니다. im-not-ai는 번들하지 않고 플러그인으로 연결합니다.
+
+```bash
+# 스킬 설치 (Claude Code)
+claude plugin marketplace add jooyeonthemaster/hwp-mcp-advanced-custom
+claude plugin install hwp-document@hwp-mcp-advanced-custom
+# 윤문 연동
+claude plugin marketplace add epoko77-ai/im-not-ai
+claude plugin install humanize-korean@im-not-ai
+```
+
 ## 🚀 주요 기능
 
 ### 기본 문서 제어

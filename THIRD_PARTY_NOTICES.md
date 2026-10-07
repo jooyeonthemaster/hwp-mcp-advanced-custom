@@ -39,6 +39,12 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 HKCU\Software\HNC\HwpAutomation\Modules\FilePathCheckerModule
 ```
 
+## im-not-ai (연동, 포함하지 않음)
+
+`skills/hwp-document` 스킬은 본문 윤문에 [epoko77-ai/im-not-ai](https://github.com/epoko77-ai/im-not-ai)
+(MIT License)의 `humanize-korean` 플러그인을 사용합니다. 이 저장소에는 그 코드가 들어 있지 않으며,
+사용자가 플러그인으로 따로 설치합니다.
+
 ## 원본 저장소
 
 본 저장소는 [crowwan/hwp-mcp-advanced-custom](https://github.com/crowwan/hwp-mcp-advanced-custom)
